@@ -6,14 +6,15 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Iterator
+from typing import Iterator, Optional
 
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chip_lots(
  lot_id TEXT PRIMARY KEY, product TEXT NOT NULL, process_rev TEXT NOT NULL,
  wafer_count INTEGER NOT NULL, status TEXT NOT NULL, owner TEXT NOT NULL,
- created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ version INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS measurements(
  measurement_id TEXT PRIMARY KEY, lot_id TEXT NOT NULL REFERENCES chip_lots(lot_id),
  wavelength_nm REAL NOT NULL, response REAL NOT NULL, noise REAL NOT NULL,
@@ -33,16 +34,21 @@ def utcnow() -> str:
 
 
 def connect(path: str = ":memory:") -> sqlite3.Connection:
-    db = sqlite3.connect(path)
+    # ThreadingHTTPServer 会在多个请求线程间共享同一个连接；跨连接的文件库
+    # 写入则依靠 BEGIN IMMEDIATE 与 busy_timeout 在 SQLite 层串行化。
+    db = sqlite3.connect(path, check_same_thread=False, timeout=5.0)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
+    db.execute("PRAGMA busy_timeout=5000")
     db.executescript(SCHEMA)
     db.commit()
     return db
 
 
 @contextmanager
-def transaction(db: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+def transaction(db: sqlite3.Connection, lock: Optional[object] = None) -> Iterator[sqlite3.Connection]:
+    if lock is not None:
+        lock.acquire()
     try:
         db.execute("BEGIN IMMEDIATE")
         yield db
@@ -50,7 +56,10 @@ def transaction(db: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     except Exception:
         db.rollback()
         raise
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 def event(db: sqlite3.Connection, lot_id: str, event_type: str, actor: str, payload: dict) -> None:
-    db.execute("INSERT INTO lot_events(lot_id,event_type,actor,payload,created_at) VALUES(?,?,?,?,?)", (lot_id, event_type, actor, json.dumps(payload, sort_keys=True), utcnow()))
+    db.execute("INSERT INTO lot_events(lot_id,event_type,actor,payload,created_at) VALUES(?,?,?,?,?)", (lot_id, event_type, actor, json.dumps(payload, sort_keys=True, ensure_ascii=False), utcnow()))
