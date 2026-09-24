@@ -6,6 +6,7 @@ import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .errors import ServiceError
 from .service import PhotonService
 
 
@@ -20,35 +21,79 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _token(self) -> str:
+        return self.headers.get("Authorization", "").removeprefix("Bearer ")
+
+    def _read_body(self) -> dict:
+        raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        if not raw:
+            return {}
+        return json.loads(raw)
+
+    def _error(self, exc: Exception) -> None:
+        if isinstance(exc, ServiceError):
+            body = {"error": str(exc), "code": exc.code}
+            if exc.details:
+                body["details"] = exc.details
+            return self._json(exc.status, body)
+        if isinstance(exc, PermissionError):
+            return self._json(403, {"error": str(exc), "code": "forbidden"})
+        if isinstance(exc, KeyError):
+            return self._json(404, {"error": str(exc.args[0]), "code": "not_found"})
+        return self._json(400, {"error": str(exc), "code": "bad_request"})
+
     def do_GET(self):
-        if self.path == "/health":
-            return self._json(200, {"status": "ok", "service": "photon-fab"})
-        if self.path.startswith("/lots/"):
-            try:
-                token = self.headers.get("Authorization", "").removeprefix("Bearer ")
-                return self._json(200, self.service.get_lot(token, self.path.split("/", 2)[2]))
-            except Exception as exc:
-                return self._json(400, {"error": str(exc)})
-        return self._json(404, {"error": "not found"})
+        try:
+            if self.path == "/health":
+                return self._json(200, {"status": "ok", "service": "photon-fab"})
+            if self.path.startswith("/lots/"):
+                parts = self.path.strip("/").split("/")
+                token = self._token()
+                if len(parts) == 2:
+                    return self._json(200, self.service.get_lot(token, parts[1]))
+                if len(parts) == 3 and parts[2] == "audit":
+                    return self._json(200, {"events": self.service.audit(token, parts[1])})
+            return self._json(404, {"error": "not found", "code": "not_found"})
+        except Exception as exc:
+            return self._error(exc)
 
     def do_POST(self):
         try:
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+            body = self._read_body()
             if self.path == "/login":
-                return self._json(200, {"token": self.service.auth.login(body["user_id"], body["password"])})
-            token = self.headers.get("Authorization", "").removeprefix("Bearer ")
+                return self._json(200, {"token": self.service.login(body["user_id"], body["password"])})
+            token = self._token()
             if self.path == "/lots":
-                return self._json(201, self.service.create_lot(token, body["lot_id"], body["product"], body["process_rev"], body["wafer_count"]))
-            if self.path.startswith("/lots/") and self.path.endswith("/measurements"):
-                lot_id = self.path.split("/")[2]
-                return self._json(201, self.service.add_measurement(token, lot_id, body["wavelength_nm"], body["response"], body.get("noise", 0.0), body["instrument"]))
-            if self.path.startswith("/lots/") and self.path.endswith("/analysis"):
-                return self._json(200, self.service.analyze(token, self.path.split("/")[2]))
-            return self._json(404, {"error": "not found"})
-        except PermissionError as exc:
-            return self._json(403, {"error": str(exc)})
+                return self._json(
+                    201,
+                    self.service.create_lot(token, body["lot_id"], body["product"], body["process_rev"], body["wafer_count"]),
+                )
+            if self.path.startswith("/lots/"):
+                parts = self.path.strip("/").split("/")
+                if len(parts) == 3 and parts[2] == "measurements":
+                    return self._json(
+                        201,
+                        self.service.add_measurement(
+                            token, parts[1], body["wavelength_nm"], body["response"], body.get("noise", 0.0), body["instrument"]
+                        ),
+                    )
+                if len(parts) == 3 and parts[2] == "analysis":
+                    return self._json(200, self.service.analyze(token, parts[1]))
+                if len(parts) == 3 and parts[2] == "approvals":
+                    expected_version = body.get("expected_version")
+                    return self._json(
+                        200,
+                        self.service.approve(
+                            token,
+                            parts[1],
+                            body["decision"],
+                            body["reason"],
+                            int(expected_version) if expected_version is not None else None,
+                        ),
+                    )
+            return self._json(404, {"error": "not found", "code": "not_found"})
         except Exception as exc:
-            return self._json(400, {"error": str(exc)})
+            return self._error(exc)
 
 
 def main() -> None:

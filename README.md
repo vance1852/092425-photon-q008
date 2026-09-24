@@ -66,6 +66,8 @@ PYTHONPATH=src python3 -m photon_fab.api --database photon.sqlite3 --port 8080
 
 HTTP 健康检查为 `GET /health`，登录、批次、测量和分析请求均支持 JSON；服务不访问外部网络，可在单个 Linux 应用容器中完成验收。
 
+质量审批为 `POST /lots/{lot_id}/approvals`，请求体 `{"decision": "release|hold|reject", "reason": "...", "expected_version": 可选}`。审批采用条件更新：批次只能从待审核状态（`engineering`）转为终态，成功后批次 `version` 加一；可携带 `expected_version` 做乐观并发检查。相反决定或过期版本返回 `409 conflict`，响应体的 `details` 给出当前状态、版本和已生效决定，批次状态不变，冲突尝试以 `approval.conflicted` 事件进入审计。重复提交与已生效决定相同的决定时原样返回原结果，不写状态也不写审计。审计可通过 `GET /lots/{lot_id}/audit` 查询，服务重启后状态、版本与审计历史保持稳定。
+
 ## HTTP 服务
 
 ```bash
